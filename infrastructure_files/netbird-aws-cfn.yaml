@@ -1,0 +1,237 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: NetBird VPN Server self-hosted on AWS with Route 53 and Embedded Dex IdP
+
+Parameters:
+  DomainName:
+    Type: String
+    Default: netbird.toaster.town
+    Description: FQDN for NetBird Server
+  HostedZoneId:
+    Type: String
+    Default: Z06027371AS776267N5WH
+    Description: Route 53 Hosted Zone ID for toaster.town
+  AdminEmail:
+    Type: String
+    Default: mike@beef.tips
+    Description: Email address for Lets Encrypt TLS registration
+  InstanceType:
+    Type: String
+    Default: t4g.small
+    Description: EC2 instance type (ARM64 Graviton recommended for cost/perf)
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Default: us-east-1
+    Description: SSH KeyPair name
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Default: vpc-eaff2e90
+    Description: VPC ID for deployment
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Default: subnet-d05fdab7
+    Description: Public Subnet ID in VPC
+  AmiId:
+    Type: AWS::EC2::Image::Id
+    Default: ami-0f6435163a86ffc8c
+    Description: Ubuntu 24.04 LTS ARM64 AMI
+
+Resources:
+  NetBirdSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: NetBird VPN Server - Traefik, gRPC, STUN/TURN
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP - Lets Encrypt ACME verification
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS - Traefik reverse proxy
+        - IpProtocol: udp
+          FromPort: 3478
+          ToPort: 3478
+          CidrIp: 0.0.0.0/0
+          Description: STUN/TURN - Coturn server
+        - IpProtocol: udp
+          FromPort: 49152
+          ToPort: 65535
+          CidrIp: 0.0.0.0/0
+          Description: TURN Relay UDP port range
+      Tags:
+        - Key: Name
+          Value: netbird-security-group
+
+  NetBirdRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Tags:
+        - Key: Name
+          Value: netbird-ec2-ssm-role
+
+  NetBirdInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref NetBirdRole
+
+  NetBirdEIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: netbird-server-eip
+
+  NetBirdDNSRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Sub "${DomainName}."
+      Type: A
+      TTL: '300'
+      ResourceRecords:
+        - !Ref NetBirdEIP
+
+  NetBirdInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !Ref AmiId
+      KeyName: !Ref KeyName
+      SubnetId: !Ref SubnetId
+      IamInstanceProfile: !Ref NetBirdInstanceProfile
+      SecurityGroupIds:
+        - !Ref NetBirdSecurityGroup
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 20
+            VolumeType: gp3
+            DeleteOnTermination: false
+      Tags:
+        - Key: Name
+          Value: NetBird Server
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euo pipefail
+          exec > >(tee -a /var/log/netbird-setup.log) 2>&1
+          echo "=== Starting NetBird automated setup at $(date) ==="
+
+          while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || fuser /var/lib/apt/lists/lock >/dev/null 2>&1; do
+            echo "Waiting for apt lock..."
+            sleep 3
+          done
+
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -y
+          apt-get install -y docker.io docker-compose-v2 curl jq git dnsutils
+
+          systemctl enable --now docker
+          usermod -aG docker ubuntu
+
+          TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+          PUBLIC_IP=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/public-ipv4)
+          echo "Instance public IP is $PUBLIC_IP"
+
+          echo "Waiting for ${DomainName} to resolve to $PUBLIC_IP..."
+          for i in {1..60}; do
+            RESOLVED_IP=$(dig +short "${DomainName}" @1.1.1.1 | tail -n1 || true)
+            if [[ "$RESOLVED_IP" == "$PUBLIC_IP" ]]; then
+              echo "DNS resolution verified (${DomainName} -> $RESOLVED_IP)"
+              break
+            fi
+            echo "DNS not ready yet (got: '$RESOLVED_IP', expected: '$PUBLIC_IP'). Retrying in 5s... ($i/60)"
+            sleep 5
+          done
+
+          cd /home/ubuntu
+          if [ ! -d "netbird" ]; then
+            git clone https://github.com/netbirdio/netbird.git
+          fi
+          chown -R ubuntu:ubuntu netbird
+
+          cd netbird/infrastructure_files
+
+          export NETBIRD_NON_INTERACTIVE="true"
+          export NETBIRD_DOMAIN="${DomainName}"
+          export NETBIRD_LETSENCRYPT_EMAIL="${AdminEmail}"
+          export NETBIRD_REVERSE_PROXY_TYPE="0"
+          export NETBIRD_ENABLE_PROXY="false"
+          export NETBIRD_ENABLE_CROWDSEC="false"
+
+          echo "Executing getting-started.sh..."
+          ./getting-started.sh
+
+          echo "=== NetBird automated setup complete at $(date) ==="
+
+  NetBirdEIPAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      AllocationId: !GetAtt NetBirdEIP.AllocationId
+      InstanceId: !Ref NetBirdInstance
+
+  NetBirdDataVolume:
+    Type: AWS::EC2::Volume
+    Properties:
+      AvailabilityZone: !GetAtt NetBirdInstance.AvailabilityZone
+      Size: 20
+      VolumeType: gp3
+      Encrypted: true
+      Tags:
+        - Key: Name
+          Value: netbird-data-volume
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+
+  NetBirdDataVolumeAttachment:
+    Type: AWS::EC2::VolumeAttachment
+    Properties:
+      Device: /dev/xvdf
+      InstanceId: !Ref NetBirdInstance
+      VolumeId: !Ref NetBirdDataVolume
+
+  NetBirdRecoveryAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Auto-recover NetBird EC2 instance on system status check failure
+      Namespace: AWS/EC2
+      MetricName: StatusCheckFailed_System
+      Statistic: Minimum
+      Period: 60
+      EvaluationPeriods: 2
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: 0
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref NetBirdInstance
+      AlarmActions:
+        - !Sub "arn:aws:automate:${AWS::Region}:ec2:recover"
+
+Outputs:
+  DashboardURL:
+    Description: NetBird Management Dashboard
+    Value: !Sub "https://${DomainName}"
+  ServerPublicIP:
+    Description: Allocated Elastic IP
+    Value: !Ref NetBirdEIP
+  InstanceId:
+    Description: EC2 Instance ID
+    Value: !Ref NetBirdInstance
+  DataVolumeId:
+    Description: Dedicated Persistent EBS Volume ID
+    Value: !Ref NetBirdDataVolume
